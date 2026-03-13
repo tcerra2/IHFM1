@@ -1,0 +1,7 @@
+path: police_cars_dataset
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names: ['chicago_police_car']
