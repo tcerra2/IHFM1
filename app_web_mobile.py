@@ -2,14 +2,13 @@ import cv2
 import numpy as np
 import asyncio
 import json
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
+import gc
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import base64
 from ultralytics import YOLO
 from pathlib import Path
-import io
 
 app = FastAPI()
 
@@ -28,37 +27,34 @@ class AppState:
         self.iou = 0.7
         self.model_type = 'general'
         self.show_edge_detection = False
-        self.show_track_trails = False
         self.camera_brightness = 0.0
         self.camera_contrast = 1.0
         self.camera_saturation = 1.0
         self.camera_exposure = 0.0
         self.model = None
+        self.model_lock = asyncio.Lock()
+        self.last_model_type = None
 
 state = AppState()
-active_connections = []
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: dict = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, client_id: str):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[client_id] = websocket
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            del self.active_connections[client_id]
 
-    async def broadcast(self, message: str):
-        disconnected = []
-        for connection in self.active_connections:
+    async def send_to_client(self, client_id: str, message: str):
+        if client_id in self.active_connections:
             try:
-                await connection.send_text(message)
+                await self.active_connections[client_id].send_text(message)
             except:
-                disconnected.append(connection)
-        
-        for connection in disconnected:
-            self.disconnect(connection)
+                self.disconnect(client_id)
 
 manager = ConnectionManager()
 
@@ -83,7 +79,31 @@ def adjust_frame_lighting(frame: np.ndarray, brightness: float, contrast: float,
     
     img = np.clip(img, 0, 1) * 255
     return img.astype(np.uint8)
-
+async def load_model_if_needed(model_type: str):
+    """Load model ONLY if type changed (NOT on every settings update)."""
+    if state.last_model_type == model_type and state.model is not None:
+        return  # Model already loaded, skip!
+    
+    async with state.model_lock:
+        try:
+            # Release old model
+            if state.model is not None:
+                del state.model
+                gc.collect()
+            
+            if model_type == 'face':
+                print("Loading face detection model...")
+                state.model = YOLO('yolov8n-face.pt')
+            else:
+                print("Loading general detection model...")
+                state.model = YOLO('yolov8n.pt')
+            
+            state.last_model_type = model_type
+            print(f"✓ Model loaded: {model_type}")
+        
+        except Exception as e:
+            print(f"Model loading error: {e}")
+            state.model = None
 def get_class_color(class_id: int) -> tuple:
     """Get unique BGR color for each class."""
     colors = [
@@ -96,13 +116,8 @@ def get_class_color(class_id: int) -> tuple:
 def process_frame(frame):
     """Process frame with YOLO."""
     try:
-        # Lazy load model on first use
         if state.model is None:
-            print("Loading YOLO model on first request...")
-            if state.model_type == 'face':
-                state.model = YOLO('yolov8n-face.pt')
-            else:
-                state.model = YOLO('yolov8n.pt')
+            return frame
         
         # Apply camera adjustments
         if (state.camera_brightness != 0.0 or state.camera_contrast != 1.0 or 
@@ -167,9 +182,10 @@ def process_frame(frame):
         print(f"Frame processing error: {e}")
         return frame
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str):
+    await manager.connect(websocket, client_id)
+    
     try:
         while True:
             data = await websocket.receive_text()
@@ -182,22 +198,25 @@ async def websocket_endpoint(websocket: WebSocket):
                     settings = message['data']
                     state.confidence = settings.get('confidence', state.confidence)
                     state.iou = settings.get('iou', state.iou)
-                    state.model_type = settings.get('model_type', state.model_type)
                     state.show_edge_detection = settings.get('show_edge_detection', state.show_edge_detection)
                     state.camera_brightness = settings.get('camera_brightness', state.camera_brightness)
                     state.camera_contrast = settings.get('camera_contrast', state.camera_contrast)
                     state.camera_saturation = settings.get('camera_saturation', state.camera_saturation)
                     state.camera_exposure = settings.get('camera_exposure', state.camera_exposure)
                     
-                    # Reload model only when user changes it (lazy load)
-                    if state.model_type == 'face':
-                        print("Switching to face detection model...")
-                        state.model = YOLO('yolov8n-face.pt')
-                    else:
-                        print("Switching to general detection model...")
-                        state.model = YOLO('yolov8n.pt')
+                    # ONLY load model if TYPE changed
+                    new_model_type = settings.get('model_type', state.model_type)
+                    if new_model_type != state.model_type:
+                        state.model_type = new_model_type
+                        await load_model_if_needed(new_model_type)
                 
                 elif message['type'] == 'frame':
+                    # Ensure model is loaded
+                    await load_model_if_needed(state.model_type)
+                    
+                    if state.model is None:
+                        continue
+                    
                     # Process frame from mobile camera
                     frame_data = message['data']
                     frame_bytes = base64.b64decode(frame_data)
@@ -215,8 +234,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         _, buffer = cv2.imencode('.jpg', processed, [cv2.IMWRITE_JPEG_QUALITY, 80])
                         result_b64 = base64.b64encode(buffer).decode()
                         
-                        # Send back to all clients
-                        await manager.broadcast(json.dumps({
+                        # Send ONLY to this client (not broadcast)
+                        await manager.send_to_client(client_id, json.dumps({
                             'type': 'processed_frame',
                             'data': result_b64
                         }))
@@ -225,7 +244,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 print(f"Message error: {e}")
     
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(client_id)
 
 @app.get("/")
 async def get_index():
@@ -431,7 +450,8 @@ def get_html():
     </div>
     
     <script>
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        const clientId = 'client_' + Math.random().toString(36).substr(2, 9);
+        const ws = new WebSocket(`ws://${window.location.host}/ws/${clientId}`);
         const video = document.getElementById('cameraFeed');
         const canvas = document.getElementById('videoCanvas');
         const ctx = canvas.getContext('2d');
