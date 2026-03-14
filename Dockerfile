@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install system dependencies (minimal)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsm6 libxext6 libxrender-dev \
+    libsm6 libxext6 libxrender-dev libgl1-mesa-glx \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
