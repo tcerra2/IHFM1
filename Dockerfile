@@ -17,5 +17,5 @@ RUN pip install --no-cache-dir torch torchvision torchaudio --index-url https://
 # Copy app
 COPY . .
 
-# Run
-CMD ["uvicorn", "app_web_mobile:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run with shell to expand $PORT
+CMD sh -c "uvicorn app_web_mobile:app --host 0.0.0.0 --port ${PORT:-8000}"
